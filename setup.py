@@ -1,4 +1,4 @@
-# PyTorch is built with scikit-build-core through the PEP 517 interface
+ # PyTorch is built with scikit-build-core through the PEP 517 interface
 # declared in pyproject.toml; pip and `python -m build` never run this
 # file. It exists only for direct `python setup.py <command>` calls:
 # install and develop are forwarded to pip, everything else fails with
