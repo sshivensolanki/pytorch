@@ -6,7 +6,9 @@ import collections
 import contextlib
 import copy
 import hashlib
+import inspect
 import json
+import logging
 import os
 import pickle
 import threading
@@ -23,8 +25,12 @@ from torch.compiler._no_compile import is_compilation_forbidden, no_compilation
 from torch.utils._appending_byte_serializer import AppendingByteSerializer
 
 
+log = logging.getLogger(__name__)
+
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
+    from types import ModuleType
 
     from torch._inductor.runtime.triton_heuristics import (
         CachingAutotuner,
@@ -48,6 +54,105 @@ _frozen_triton_kernels_lock = threading.Lock()
 # producer's absolute include and library paths.
 _frozen_cpp_kernels: dict[str, bytes] = {}
 _frozen_cpp_kernels_lock = threading.Lock()
+
+
+def _triton_runtime_cache() -> ModuleType | None:
+    """Return ``triton.runtime.cache`` if this Triton can export its runtime cache.
+
+    Without it, finalization still freezes Inductor's static Triton launchers and
+    C++ kernels, but kernels launched directly through Triton's JIT are not captured
+    and compile again on first use in the serving process. The API is matched by
+    signature, so a Triton whose runtime-cache API differs counts as one without it.
+    """
+    try:
+        from triton.runtime import cache
+        from triton.runtime._async_compile import (  # noqa: F401
+            wait_for_pending_compiles,
+        )
+    except ImportError:
+        return None
+    required = {
+        "export_runtime_cache": "context",
+        "import_runtime_cache": "context",
+        "_runtime_cache_root": "require_explicit",
+    }
+    for name, keyword in required.items():
+        try:
+            parameter = inspect.signature(getattr(cache, name)).parameters[keyword]
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return None
+        if parameter.kind not in (
+            inspect.Parameter.KEYWORD_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            return None
+    return cache
+
+
+def _runtime_context() -> dict[str, str | None]:
+    import torch
+    from torch._inductor.codecache import torch_key
+
+    return {"torch_key": torch_key().hex(), "torch_cuda": torch.version.cuda}
+
+
+# (artifact key, runtime-cache root) pairs already imported by this process, so
+# precompile.load after prepare_runtime does not extract the same cache again.
+_imported_triton_runtime: set[tuple[str, str]] = set()
+_imported_triton_runtime_lock = threading.Lock()
+
+
+@CacheArtifactFactory.register
+class TritonRuntimeCacheArtifact(CacheArtifact):
+    @staticmethod
+    def type() -> str:
+        return "triton_runtime"
+
+    @staticmethod
+    def populate_first() -> bool:
+        # Graph artifacts can launch Triton kernels as they load.
+        return True
+
+    def populate_cache(self) -> None:
+        self.import_into_triton(strict=is_compilation_forbidden())
+
+    def import_into_triton(self, *, strict: bool) -> None:
+        cache = _triton_runtime_cache()
+        problem = None
+        root = None
+        if cache is None:
+            problem = "the installed Triton cannot import one"
+        else:
+            from triton import knobs
+
+            try:
+                root = str(cache._runtime_cache_root())
+            except RuntimeError as exc:
+                problem = f"Triton has no cache directory to import it into ({exc})"
+            if root is not None and not knobs.autotuning.cache:
+                problem = (
+                    "Triton's autotuning cache is disabled (TRITON_CACHE_AUTOTUNING=1 "
+                    "enables it), so the captured autotuning decisions are ignored"
+                )
+        if problem is not None:
+            message = (
+                f"The precompile cache contains a Triton runtime cache, but {problem}"
+            )
+            if strict:
+                raise RuntimeError(message)
+            log.warning(
+                "%s; Triton JIT kernels will compile or autotune on first use", message
+            )
+            if root is None:
+                return
+        imported = (self.key, root)
+        with _imported_triton_runtime_lock:
+            if imported in _imported_triton_runtime:
+                return
+            if hashlib.sha256(self.content).hexdigest() != self.key:
+                raise RuntimeError("Corrupt Triton runtime-cache artifact")
+            cache.import_runtime_cache(self.content, context=_runtime_context())
+            _imported_triton_runtime.add(imported)
 
 
 @CacheArtifactFactory.register
@@ -320,7 +425,8 @@ def _freeze_triton_kernel(key: str, instances: list[CachingAutotuner]) -> bytes:
 
 
 class _RuntimeCapture:
-    def __init__(self) -> None:
+    def __init__(self, cache_root: str | None) -> None:
+        self.cache_root = cache_root
         self.pid = os.getpid()
         self.sealed = False
         self.policy = contextlib.ExitStack()
@@ -356,6 +462,9 @@ def _active_capture() -> _RuntimeCapture | None:
 def capture_runtime() -> Iterator[None]:
     """Own one producer lifetime, including strict validation and cleanup.
 
+    When Triton can export its runtime cache, set an attempt-private
+    TRITON_CACHE_DIR and enable Triton's autotuning cache (for example
+    TRITON_CACHE_AUTOTUNING=1) before application imports.
     Finalizing the cache seals this scope against further compiler work until the
     outer application cleanup has returned.
     """
@@ -364,7 +473,25 @@ def capture_runtime() -> Iterator[None]:
         raise _precompile_error(
             "precompile.capture_runtime cannot start while compilation is forbidden"
         )
-    owner = _RuntimeCapture()
+    cache_root = None
+    if (cache := _triton_runtime_cache()) is not None:
+        from triton import knobs
+
+        try:
+            root = cache._runtime_cache_root(require_explicit=True)
+        except Exception as exc:
+            raise _precompile_error(
+                "precompile.capture_runtime requires an explicit, attempt-private "
+                "TRITON_CACHE_DIR before application imports"
+            ) from exc
+        if not knobs.autotuning.cache:
+            raise _precompile_error(
+                "precompile.capture_runtime requires Triton's autotuning cache "
+                "(TRITON_CACHE_AUTOTUNING=1) before application imports"
+            )
+        root.mkdir(parents=True, exist_ok=True)
+        cache_root = str(root)
+    owner = _RuntimeCapture(cache_root)
     with _capture_lock:
         if _active_capture() is not None:
             raise _precompile_error(
@@ -401,6 +528,8 @@ def finalize_runtime_cache(
     import torch
     from torch._inductor.async_compile import AsyncCompile
 
+    cache = _triton_runtime_cache()
+
     owner = _active_capture()
     if owner is None:
         raise RuntimeError(
@@ -411,6 +540,8 @@ def finalize_runtime_cache(
             raise RuntimeError(
                 "The precompile runtime cache has already been finalized"
             )
+        if cache is not None and str(cache._runtime_cache_root()) != owner.cache_root:
+            raise RuntimeError("The runtime-cache namespace changed during capture")
         artifacts = (
             CacheArtifactManager.deserialize(artifact) if artifact is not None else {}
         )
@@ -419,6 +550,7 @@ def finalize_runtime_cache(
         if any(
             kind in artifacts
             for kind in (
+                TritonRuntimeCacheArtifact.type(),
                 InductorTritonCacheArtifact.type(),
                 InductorCppCacheArtifact.type(),
             )
@@ -435,6 +567,10 @@ def finalize_runtime_cache(
         # no binary is missing or partially written when it is frozen.
         for load in cpp_loads:
             load()
+        if cache is not None:
+            from triton.runtime._async_compile import wait_for_pending_compiles
+
+            wait_for_pending_compiles()
         if torch.cuda.is_initialized():
             torch.cuda.synchronize()
         with _capture_lock:
@@ -464,6 +600,13 @@ def finalize_runtime_cache(
                 raise error
             static_payload = pickle.dumps(static_kernels)
             cpp_payload = _freeze_cpp_kernels(cpp_kernels)
+            if cache is not None:
+                payload = cache.export_runtime_cache(context=_runtime_context())
+                artifacts[TritonRuntimeCacheArtifact.type()] = [
+                    TritonRuntimeCacheArtifact(
+                        hashlib.sha256(payload).hexdigest(), payload
+                    )
+                ]
             artifacts[InductorTritonCacheArtifact.type()] = [
                 InductorTritonCacheArtifact(
                     hashlib.sha256(static_payload).hexdigest(), static_payload
@@ -495,3 +638,10 @@ def prepare_runtime_cache(artifact: bytes | None) -> None:
             "precompile.prepare_runtime requires a cache produced by "
             "precompile.finalize_cache"
         )
+    runtime = artifacts.get(TritonRuntimeCacheArtifact.type(), ())
+    if len(runtime) > 1:
+        raise RuntimeError(
+            "precompile.prepare_runtime found more than one Triton runtime cache"
+        )
+    for entry in runtime:
+        entry.import_into_triton(strict=True)
