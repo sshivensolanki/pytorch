@@ -877,16 +877,19 @@ class ScheduleTest(MultiProcContinuousTest):
         not TEST_MULTIACCELERATOR, f"{backend} test requires 2+ GPUs"
     )
     @parametrize(
-        "ScheduleClass",
+        "ScheduleClass,max_outstanding_sends",
         [
-            ScheduleInterleaved1F1B,
-            ScheduleLoopedBFS,
-            ScheduleInterleavedZeroBubble,
+            (ScheduleInterleaved1F1B, None),
+            (ScheduleInterleaved1F1B, 4),
+            (ScheduleLoopedBFS, None),
+            (ScheduleInterleavedZeroBubble, None),
         ],
     )
     @parametrize("pre_split", [False, True])
     @skip_if_lt_x_gpu(4)
-    def test_grad_with_manual_interleaved(self, ScheduleClass, pre_split):
+    def test_grad_with_manual_interleaved(
+        self, ScheduleClass, max_outstanding_sends, pre_split
+    ):
         stages_per_rank = 2
         n_stages = stages_per_rank * self.world_size
         mod, ref_mod, x, target, loss_fn = setup_models_and_data(
@@ -910,7 +913,15 @@ class ScheduleTest(MultiProcContinuousTest):
 
         # Create schedule
         schedule = ScheduleClass(
-            stages, num_microbatches, loss_fn=loss_fn, scale_grads=False
+            stages,
+            num_microbatches,
+            loss_fn=loss_fn,
+            scale_grads=False,
+            **(
+                {"max_outstanding_sends": max_outstanding_sends}
+                if max_outstanding_sends is not None
+                else {}
+            ),
         )
 
         # Run pipeline with tensor leak checking
